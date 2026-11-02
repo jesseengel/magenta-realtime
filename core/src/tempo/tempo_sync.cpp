@@ -549,7 +549,10 @@ bool SyncConductor::plausible(double bpm) const {
 std::optional<double> SyncConductor::current_tempo() const {
   if (auto d = drift_tempo(); d && plausible(*d)) return d;
   if (auto b = beat_tempo(4.0); b && plausible(*b)) return b;
-  if (!segs_.empty() && (f_ - last_reprime_f_ < 6 * kFps || last_reprime_f_ >= 0)) return segs_.back().tempo;
+  // the tracker's own (smoothed) tempo -- lags, but it does see a drift; the
+  // last re-prime's target would hide one and re-prime at the old tempo
+  if (auto m = measured(); m && plausible(*m) && f_ - last_reprime_f_ >= 3 * kFps) return m;
+  if (!segs_.empty() && last_reprime_f_ >= 0) return segs_.back().tempo;
   return measured();
 }
 
@@ -569,6 +572,9 @@ void SyncConductor::lock_check() {
   auto e = phase_error(g);
   if (!e) return;
   const double w = pymod(*e + g.bpb / 2.0, g.bpb) - g.bpb / 2.0;
+  // a small offset can wait until the drift gives MRT2's tempo (a phase
+  // re-prime also sets the tempo, from current_tempo())
+  if (std::abs(w) < 0.5 && !drift_tempo() && f_ - last_reprime_f_ < 6 * kFps) return;
   lock_bad_ = std::abs(w) > kLockTol ? lock_bad_ + 1 : 0;
   // once locked, a jump of a beat or more needs longer evidence: the
   // tracker's downbeat can flip between two hypotheses half a bar apart
