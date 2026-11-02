@@ -28,6 +28,9 @@
 
 using magentart::core::EngineMetrics;
 
+// tempo-sync fork: loads <model>_reprime.mlxfn / _encoder.mlxfn next to a model
+static void MagentaRT_LoadTempoSyncModels(RealtimeRunner* engine, NSString* mlxfnPath);
+
 // ─── Dev server probe ────────────────────────────────────────────────────────
 
 static const int kDevServerPort = 62420;
@@ -83,7 +86,7 @@ static BOOL isDevServerRunning(void) {
 - (instancetype)init {
     AudioComponentDescription desc = {
         .componentType = kAudioUnitType_MusicDevice,
-        .componentSubType = 'MGRT',
+        .componentSubType = 'MGRS',
         .componentManufacturer = 'Goog',
         .componentFlags = 0,
         .componentFlagsMask = 0
@@ -211,6 +214,23 @@ static BOOL isDevServerRunning(void) {
 
     AUParameter* cfgDrumsParam = makeParam(@"cfgdrums", @"Drums Adherence", 48, -1.0, 7.0, 1.0);
 
+    // Host tempo / downbeat sync (tempo-sync fork). MRT2 follows the DAW's
+    // tempo and puts its downbeats on the DAW's bars by re-priming its memory
+    // (needs a model exported with magenta_rt.mlx.export_tempo).
+    auto makeBool = ^(NSString* ident, NSString* name, AUParameterAddress addr, float def) {
+        AUParameter* p = [AUParameterTree
+            createParameterWithIdentifier:ident name:name address:addr min:0.0 max:1.0
+            unit:kAudioUnitParameterUnit_Boolean unitName:nil
+            flags:kAudioUnitParameterFlag_IsWritable | kAudioUnitParameterFlag_IsReadable
+            valueStrings:nil dependentParameters:nil];
+        p.value = def;
+        return p;
+    };
+    AUParameter* hostSyncParam = makeBool(@"hostsync", @"Host Sync", 49, 0.0);
+    AUParameter* barLockParam = makeBool(@"barlock", @"Bar Lock", 50, 1.0);
+    AUParameter* syncKeepCfgParam = makeBool(@"synckeepcfg", @"Sync Keeps CFG", 51, 1.0);
+    _engine.set_bar_lock(true);
+
     NSMutableArray* allParams = [NSMutableArray arrayWithArray:@[
         tempParam, topkParam, cfgMusicCoCaParam, cfgNotesParam, volParam, muteParam, unmaskWidthParam, bufSizeParam, latencyCompParam,
         cfgDrumsParam
@@ -220,6 +240,7 @@ static BOOL isDevServerRunning(void) {
     [allParams addObject:drumlessParam];
     [allParams addObject:midiGateParam];
     [allParams addObject:onsetModeParam];
+    [allParams addObjectsFromArray:@[hostSyncParam, barLockParam, syncKeepCfgParam]];
 
     _parameterTree = [AUParameterTree createTreeWithChildren:allParams];
 
@@ -260,6 +281,9 @@ static BOOL isDevServerRunning(void) {
         else if (param.address == 46) weakSelf->_engine.set_onset_mode(value > 0.5f);
         else if (param.address == 48) weakSelf->_engine.set_cfg_drums(value);
         else if (param.address == 47) weakSelf->_engine.set_seed_rotation((int)value);
+        else if (param.address == 49) weakSelf->_engine.set_host_sync(value > 0.5f);
+        else if (param.address == 50) weakSelf->_engine.set_bar_lock(value > 0.5f);
+        else if (param.address == 51) weakSelf->_engine.set_sync_keep_cfg(value > 0.5f);
     };
     _parameterTree.implementorValueProvider = ^AUValue(AUParameter* param) {
         if (param.address == 0) return weakSelf->_engine.get_temperature();
@@ -284,6 +308,9 @@ static BOOL isDevServerRunning(void) {
         else if (param.address == 46) return weakSelf->_engine.get_onset_mode() ? 1.0f : 0.0f;
         else if (param.address == 48) return weakSelf->_engine.get_cfg_drums();
         else if (param.address == 47) return (AUValue)weakSelf->_engine.get_seed_rotation();
+        else if (param.address == 49) return weakSelf->_engine.get_host_sync() ? 1.0f : 0.0f;
+        else if (param.address == 50) return weakSelf->_engine.get_bar_lock() ? 1.0f : 0.0f;
+        else if (param.address == 51) return weakSelf->_engine.get_sync_keep_cfg() ? 1.0f : 0.0f;
         return 0.0;
     };
 
@@ -449,7 +476,7 @@ static BOOL isDevServerRunning(void) {
             } else if (isDir) {
                 NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:nil];
                 for (NSString *file in contents) {
-                    if ([file hasSuffix:@".mlxfn"]) {
+                    if ([file hasSuffix:@".mlxfn"] && ![file hasSuffix:@"_reprime.mlxfn"] && ![file hasSuffix:@"_encoder.mlxfn"]) {
                         mlxfnPath = [path stringByAppendingPathComponent:file];
                         break;
                     }
@@ -467,6 +494,7 @@ static BOOL isDevServerRunning(void) {
                 dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                     BOOL success = self->_engine.load_model(mlxfnPath.UTF8String);
                     if (success) {
+                        MagentaRT_LoadTempoSyncModels(&self->_engine, mlxfnPath);
                         if (self.prompts) {
                             std::vector<std::string> std_texts;
                             std::vector<float> std_weights;
@@ -705,6 +733,29 @@ static OSStatus ConverterDataProc(AudioConverterRef inAudioConverter,
     return noErr;
 }
 
+// Tempo-sync fork: load `<model>_reprime.mlxfn` + `<model>_encoder.mlxfn`
+// (magenta_rt.mlx.export_tempo) when they sit next to the model; the context
+// length comes from `<model>_tempo.json` (default 150 frames).
+static void MagentaRT_LoadTempoSyncModels(RealtimeRunner* engine, NSString* mlxfnPath) {
+    NSString* stem = [mlxfnPath stringByDeletingPathExtension];
+    NSString* reprime = [stem stringByAppendingString:@"_reprime.mlxfn"];
+    NSString* encoder = [stem stringByAppendingString:@"_encoder.mlxfn"];
+    NSFileManager* fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:reprime] || ![fm fileExistsAtPath:encoder]) {
+        NSLog(@"MagentaRT_AU: no tempo-sync exports next to %@ (Host Sync unavailable)", mlxfnPath.lastPathComponent);
+        return;
+    }
+    int frames = 150;
+    NSData* meta = [NSData dataWithContentsOfFile:[stem stringByAppendingString:@"_tempo.json"]];
+    if (meta) {
+        NSDictionary* j = [NSJSONSerialization JSONObjectWithData:meta options:0 error:nil];
+        if ([j isKindOfClass:[NSDictionary class]] && [j[@"reprime_frames"] isKindOfClass:[NSNumber class]])
+            frames = [j[@"reprime_frames"] intValue];
+    }
+    BOOL ok = engine->load_tempo_models(reprime.UTF8String, encoder.UTF8String, frames);
+    NSLog(@"MagentaRT_AU: tempo-sync exports %@ (%d frames of context)", ok ? @"loaded" : @"FAILED to load", frames);
+}
+
 - (AUInternalRenderBlock)internalRenderBlock {
     // Capture raw pointers — safe: their lifetimes span allocate → deallocate.
     __unsafe_unretained MagentaRTAudioUnit* unsafeSelf = self;
@@ -717,6 +768,7 @@ static OSStatus ConverterDataProc(AudioConverterRef inAudioConverter,
     __block BOOL wasResetHigh = NO;
     __block BOOL wasBeatZero = NO;
     __block BOOL wasDawPlaying = NO;
+    __block double lastBeatPosition = -1.0;
 
     return ^AUAudioUnitStatus(AudioUnitRenderActionFlags* actionFlags,
                                const AudioTimeStamp* timestamp,
@@ -767,6 +819,9 @@ static OSStatus ConverterDataProc(AudioConverterRef inAudioConverter,
                 else if (paramEvent.parameterAddress == 45) engine->set_midi_gate_enabled(paramEvent.value > 0.5f);
                 else if (paramEvent.parameterAddress == 46) engine->set_onset_mode(paramEvent.value > 0.5f);
                 else if (paramEvent.parameterAddress == 48) engine->set_cfg_drums(paramEvent.value);
+                else if (paramEvent.parameterAddress == 49) engine->set_host_sync(paramEvent.value > 0.5f);
+                else if (paramEvent.parameterAddress == 50) engine->set_bar_lock(paramEvent.value > 0.5f);
+                else if (paramEvent.parameterAddress == 51) engine->set_sync_keep_cfg(paramEvent.value > 0.5f);
             } else if (event->head.eventType == AURenderEventMIDI) {
                 const AUMIDIEvent& midiEvent = event->MIDI;
                 uint8_t status = midiEvent.data[0] & 0xF0;
@@ -835,8 +890,23 @@ static OSStatus ConverterDataProc(AudioConverterRef inAudioConverter,
 
         if (musicalContextBlock) {
             double currentBeatPosition = 0;
-            if (musicalContextBlock(NULL, NULL, NULL, &currentBeatPosition, NULL, NULL)) {
-                if (currentBeatPosition == 0.0 && !wasBeatZero) {
+            double hostTempo = 0, tsNum = 4, measureDownbeat = 0;
+            NSInteger tsDen = 4, offsetToNextBeat = 0;
+            if (musicalContextBlock(&hostTempo, &tsNum, &tsDen, &currentBeatPosition, &offsetToNextBeat, &measureDownbeat)) {
+                // Host tempo sync: the host's beat at the first sample of this
+                // buffer, which the engine maps onto its output stream. With
+                // Delay Comp on, the host places this output `latency` earlier.
+                const int bpb = (int)std::lround(tsNum * 4.0 / (double)(tsDen > 0 ? tsDen : 4));
+                const double latencyS = engine->get_latency_samples() / 48000.0;
+                // (no transport block: moving if the beat position advances)
+                const bool moving = transportBlock ? (bool)isDawPlaying
+                                                   : currentBeatPosition != lastBeatPosition;
+                lastBeatPosition = currentBeatPosition;
+                engine->set_host_transport(hostTempo, currentBeatPosition, measureDownbeat,
+                                           bpb > 0 ? bpb : 4, moving, latencyS);
+                // (Host Sync keeps the music going at beat 0 and re-aligns it
+                // instead of resetting the model.)
+                if (currentBeatPosition == 0.0 && !wasBeatZero && !engine->get_host_sync()) {
                     // Transport-rewind reset (DAW timeline jumped back to
                     // beat 0). Suppressible: a freshly-prefilled context
                     // arms a one-shot skip so re-cuing the DAW after
@@ -1174,6 +1244,21 @@ static NSString* bankFilePathAU(int index) {
             @"sampleRateIncorrect": @(sampleRate != 48000.0),
             @"droppedFrames": @(m.dropped_frames)
         };
+        magentart::tempo::SyncStatus ss = engine->get_sync_status();
+        stateUpdate[@"sync"] = @{
+            @"available": @(ss.available),
+            @"enabled": @(ss.enabled),
+            @"hostValid": @(ss.host_valid),
+            @"hostBpm": @(ss.host_bpm),
+            @"hostBpb": @(ss.host_bpb),
+            @"playing": @(ss.playing),
+            @"mrtBpm": @(ss.mrt_bpm),
+            @"offsetValid": @(ss.offset_valid),
+            @"offset": @(ss.offset_beats),
+            @"busy": @(ss.busy),
+            @"reprimes": @(ss.reprimes),
+            @"lastEvent": [NSString stringWithUTF8String:ss.last_event.c_str()]
+        };
     }
 
     stateUpdate[@"isPlaying"] = @(au.uiPlaying);
@@ -1181,7 +1266,7 @@ static NSString* bankFilePathAU(int index) {
 
     NSMutableDictionary* params = [NSMutableDictionary dictionary];
     NSMutableDictionary* weightChanges = [NSMutableDictionary dictionary];
-    for (int i = 0; i <= 46; i++) {
+    for (int i = 0; i <= 51; i++) {
         NSString* key = paramKeyForAddress(i);
         if (!key) continue;
         AUParameter* param = [au.parameterTree parameterWithAddress:i];
@@ -1243,13 +1328,17 @@ static NSString* paramKeyForAddress(AUParameterAddress address) {
         case 44: return @"drums_mute_other";
         case 45: return @"midigate";
         case 46: return @"onsetmode";
+        case 49: return @"hostsync";
+        case 50: return @"barlock";
+        case 51: return @"synckeepcfg";
         default:
             return nil;
     }
 }
 
 static BOOL paramIsBool(AUParameterAddress address) {
-    if (address == 6 || address == 9 || address == 31 || address == 32 || address == 39 || (address >= 40 && address <= 46)) return YES;
+    if (address == 6 || address == 9 || address == 31 || address == 32 || address == 39 || (address >= 40 && address <= 46) ||
+        (address >= 49 && address <= 51)) return YES;
     return NO;
 }
 
@@ -1258,7 +1347,7 @@ static BOOL paramIsBool(AUParameterAddress address) {
     if (!au) return;
 
     NSMutableDictionary* initialParams = [NSMutableDictionary dictionary];
-    for (int i = 0; i <= 46; i++) {
+    for (int i = 0; i <= 51; i++) {
         // Skip weight params — prompts carry their own weights via textPrompts.
         if (i >= 10 && i <= 15) continue;
         AUParameter* param = [au.parameterTree parameterWithAddress:i];
@@ -1362,7 +1451,7 @@ static BOOL paramIsBool(AUParameterAddress address) {
                         } else if (isDir) {
                             NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:nil];
                             for (NSString *file in contents) {
-                                if ([file hasSuffix:@".mlxfn"]) {
+                                if ([file hasSuffix:@".mlxfn"] && ![file hasSuffix:@"_reprime.mlxfn"] && ![file hasSuffix:@"_encoder.mlxfn"]) {
                                     mlxfnPath = [path stringByAppendingPathComponent:file];
                                     break;
                                 }
@@ -1780,6 +1869,7 @@ static BOOL paramIsBool(AUParameterAddress address) {
 
     if (success) {
         NSLog(@"MagentaRT_AU: Successfully loaded model.");
+        MagentaRT_LoadTempoSyncModels(engine, mlxfnPath);
         self->_modelDirectoryURL = [NSURL fileURLWithPath:[mlxfnPath stringByDeletingLastPathComponent]];
 
         NSMutableDictionary* stateUpdate = [NSMutableDictionary dictionaryWithDictionary:@{
@@ -1872,7 +1962,7 @@ static BOOL paramIsBool(AUParameterAddress address) {
                     } else if (isDir) {
                         NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:nil];
                         for (NSString *file in contents) {
-                            if ([file hasSuffix:@".mlxfn"]) {
+                            if ([file hasSuffix:@".mlxfn"] && ![file hasSuffix:@"_reprime.mlxfn"] && ![file hasSuffix:@"_encoder.mlxfn"]) {
                                 mlxfnPath = [path stringByAppendingPathComponent:file];
                                 break;
                             }

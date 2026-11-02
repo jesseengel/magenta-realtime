@@ -7,11 +7,11 @@
     <key>CFBundleExecutable</key>
     <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
     <key>CFBundleIdentifier</key>
-    <string>com.google.mrt2.au</string>
+    <string>com.google.mrt2sync.au</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>MRT2_AU</string>
+    <string>MRT2Sync_AU</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon.icns</string>
     <key>CFBundlePackageType</key>
@@ -36,13 +36,13 @@
                     <key>type</key>
                     <string>aumu</string>
                     <key>subtype</key>
-                    <string>MGR2</string>
+                    <string>MGRS</string>
                     <key>manufacturer</key>
                     <string>Goog</string>
                     <key>name</key>
-                    <string>Google: MRT2</string>
+                    <string>Google: MRT2 Sync</string>
                     <key>description</key>
-                    <string>Real-time music generation</string>
+                    <string>Real-time music generation, synced to the host tempo and bars</string>
                     <key>factoryFunction</key>
                     <string>MagentaRTViewController</string>
                     <key>version</key>

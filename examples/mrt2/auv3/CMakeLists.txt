@@ -50,7 +50,7 @@ set_target_properties(mrt2_au PROPERTIES
     MACOSX_BUNDLE_EXECUTABLE_NAME MRT2_AU
     MACOSX_BUNDLE_BUNDLE_NAME "MRT2_AU"
     MACOSX_BUNDLE_ICON_FILE "AppIcon.icns"
-    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.google.mrt2.au"
+    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.google.mrt2sync.au"
 )
 
 # ─── AUv3 Host App (.app) ─────────────────────────────────────────────────────
@@ -69,9 +69,9 @@ set_target_properties(mrt2_au_app PROPERTIES
     MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/HostInfo.plist.in"
     MACOSX_BUNDLE_EXECUTABLE_NAME MRT2_AUApp
-    MACOSX_BUNDLE_BUNDLE_NAME "MRT2 (AU)"
+    MACOSX_BUNDLE_BUNDLE_NAME "MRT2 Sync (AU)"
     MACOSX_BUNDLE_ICON_FILE "AppIcon.icns"
-    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.google.mrt2.au.host"
+    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.google.mrt2sync.au.host"
 )
 
 
@@ -84,7 +84,7 @@ set(RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/resources")
 set(EXTERNAL_RESOURCE_DIR "$ENV{HOME}/Documents/Magenta/magenta-rt-v2/resources")
 set(ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/Entitlements.plist")
 
-add_custom_target(deploy_mrt2_au ALL
+add_custom_target(deploy_mrt2_au
     DEPENDS mrt2_au_app mrt2_au
     # Re-embed appex into host app (always, not just on re-link)
     COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -117,22 +117,56 @@ add_custom_target(deploy_mrt2_au ALL
         "$<TARGET_BUNDLE_DIR:mrt2_au_app>"
     # Deploy to ~/Applications
     COMMAND ${CMAKE_COMMAND} -E remove_directory
-        "$ENV{HOME}/Applications/MRT2 (AU).app"
+        "$ENV{HOME}/Applications/MRT2 Sync (AU).app"
     COMMAND ditto
         "$<TARGET_BUNDLE_DIR:mrt2_au_app>"
-        "$ENV{HOME}/Applications/MRT2 (AU).app"
+        "$ENV{HOME}/Applications/MRT2 Sync (AU).app"
     # Kill registrar first so it restarts fresh, then register
     COMMAND sh -c "killall -9 AudioComponentRegistrar 2>/dev/null || true"
     COMMAND sleep 1
-    COMMAND sh -c "pluginkit -a '$ENV{HOME}/Applications/MRT2 (AU).app/Contents/PlugIns/MRT2_AU.appex' 2>/dev/null || true"
-    COMMENT "Embedding, signing, and deploying MRT2 (AU).app"
+    COMMAND sh -c "pluginkit -a '$ENV{HOME}/Applications/MRT2 Sync (AU).app/Contents/PlugIns/MRT2_AU.appex' 2>/dev/null || true"
+    COMMENT "Embedding, signing, and deploying MRT2 Sync (AU).app"
     VERBATIM
 )
 
-# Notarize the deployed MRT2 (AU).app (requires Developer ID).
+# Notarize the deployed MRT2 Sync (AU).app (requires Developer ID).
 magentart_add_notarize_target(notarize_mrt2_au
-    APP "$ENV{HOME}/Applications/MRT2 (AU).app"
+    APP "$ENV{HOME}/Applications/MRT2 Sync (AU).app"
     DEPENDS deploy_mrt2_au
-    ZIP_NAME "MRT2_AU.zip"
+    ZIP_NAME "MRT2Sync_AU.zip"
     EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/INSTALL.md"
+)
+
+# ─── tempo-sync fork: package without deploying ─────────────────────────────
+# Embeds the appex, the React UI and mlx.metallib and signs, like
+# deploy_mrt2_au, but leaves the app (mrt2_au_app.app) in the build tree (no copy
+# to ~/Applications, no pluginkit registration). Install it yourself:
+#   ditto build/examples/mrt2/auv3/mrt2_au_app.app "$HOME/Applications/MRT2 Sync (AU).app"
+#   open "$HOME/Applications/MRT2 Sync (AU).app"   # registers the AU extension
+add_custom_target(package_mrt2_au_local
+    DEPENDS mrt2_au_app mrt2_au
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_BUNDLE_DIR:mrt2_au_app>/Contents/PlugIns"
+    COMMAND ${CMAKE_COMMAND} -E remove_directory
+        "$<TARGET_BUNDLE_DIR:mrt2_au_app>/Contents/PlugIns/MRT2_AU.appex"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "$<TARGET_BUNDLE_DIR:mrt2_au>"
+        "$<TARGET_BUNDLE_DIR:mrt2_au_app>/Contents/PlugIns/MRT2_AU.appex"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_BUNDLE_DIR:mrt2_au_app>/Contents/PlugIns/MRT2_AU.appex/Contents/Resources/ui"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/../react_ui/dist"
+        "$<TARGET_BUNDLE_DIR:mrt2_au_app>/Contents/PlugIns/MRT2_AU.appex/Contents/Resources/ui"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "${mlx_BINARY_DIR}/mlx/backend/metal/kernels/mlx.metallib"
+        "$<TARGET_BUNDLE_DIR:mrt2_au_app>/Contents/PlugIns/MRT2_AU.appex/Contents/MacOS/mlx.metallib"
+    COMMAND codesign ${CODESIGN_FLAGS}
+        "$<TARGET_BUNDLE_DIR:mrt2_au_app>/Contents/PlugIns/MRT2_AU.appex/Contents/MacOS/mlx.metallib"
+    COMMAND codesign ${CODESIGN_FLAGS}
+        --entitlements "${ENTITLEMENTS}" --generate-entitlement-der
+        "$<TARGET_BUNDLE_DIR:mrt2_au_app>/Contents/PlugIns/MRT2_AU.appex"
+    COMMAND codesign ${CODESIGN_FLAGS}
+        "$<TARGET_BUNDLE_DIR:mrt2_au_app>"
+    COMMENT "Embedding and signing MRT2 Sync (AU).app in the build tree (not deployed)"
+    VERBATIM
 )

@@ -72,9 +72,12 @@ const paramKeyForAddress: Record<number, string> = {
   46: 'onsetmode',
   47: 'seedrotation',
   48: 'cfgdrums',
+  49: 'hostsync',
+  50: 'barlock',
+  51: 'synckeepcfg',
 };
 
-const boolParams = new Set([6, 9, 31, 32, 39, 45, 46]);
+const boolParams = new Set([6, 9, 31, 32, 39, 45, 46, 49, 50, 51]);
 
 // ─── Computer keyboard → MIDI (Ableton Live layout) ──────────────────────────
 // Base row (lower octave): A S D F G H J = C D E F G A B, with W E T Y U as
@@ -105,6 +108,16 @@ const DEFAULT_PARAMS = {
   drumless: false,
   midigate: false,
   onsetmode: false,
+  hostsync: false,
+  barlock: true,
+  synckeepcfg: true,
+};
+
+// Host tempo / downbeat sync status (tempo-sync fork), pushed with the metrics.
+type SyncStatus = {
+  available: boolean; enabled: boolean; hostValid: boolean; hostBpm: number; hostBpb: number;
+  playing: boolean; mrtBpm: number; offsetValid: boolean; offset: number; busy: boolean;
+  reprimes: number; lastEvent: string;
 };
 
 // Default surface positions (normalised 0–1) — purely frontend state
@@ -141,6 +154,7 @@ export default function App() {
   });
 
   const [localLoadingIndices, setLocalLoadingIndices] = useState<Set<number>>(new Set());
+  const [sync, setSync] = useState<SyncStatus | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
 
@@ -461,6 +475,7 @@ export default function App() {
       if (state.audioLevels) {
         setMetrics(m => ({ ...m, leftLevel: state.audioLevels.left, rightLevel: state.audioLevels.right }));
       }
+      if (state.sync) setSync(state.sync);
       if (state.modelName !== undefined) setModelName(state.modelName);
       if (state.isPlaying !== undefined) setIsPlaying(state.isPlaying);
       if (state.localModels !== undefined) setLocalModels(state.localModels);
@@ -1061,6 +1076,30 @@ export default function App() {
                   onChange={(v) => sendParamChange(9, v ? 1 : 0)}
                   tooltip="Reports the plugin's internal buffering latency to your DAW. When enabled, your host DAW will automatically shift all other project tracks to keep the AI's generation in perfect sync with the grid."
                 />
+              )}
+              {isAUv3 && (sync === null || sync.available) && (
+                <MagentaToggle
+                  label="Host Sync"
+                  checked={params.hostsync}
+                  onChange={(v) => sendParamChange(49, v ? 1 : 0)}
+                  tooltip="Follows the DAW's tempo and puts the music's downbeats on the DAW's bars. MRT2 has no tempo input: on a beat, its memory is rebuilt from a time-stretched copy of its own last 6 s (a 're-prime', ~0.3 s), and it continues from there. Needs a model exported with magenta_rt.mlx.export_tempo."
+                />
+              )}
+              {isAUv3 && params.hostsync && (
+                <MagentaToggle
+                  label="Bar Lock"
+                  checked={params.barlock}
+                  onChange={(v) => sendParamChange(50, v ? 1 : 0)}
+                  tooltip="Also keeps the music's downbeat on the DAW's bar (off: tempo only). A correction rewinds the music by up to one bar."
+                />
+              )}
+              {isAUv3 && params.hostsync && sync && (
+                <div style={{ fontSize: '10px', lineHeight: '14px', opacity: 0.75, maxWidth: '150px' }}>
+                  {sync.hostValid ? `Host ${sync.hostBpm.toFixed(1)} BPM ${sync.hostBpb}/4` : 'No host tempo'}<br />
+                  {sync.mrtBpm > 0 ? `MRT2 ${sync.mrtBpm.toFixed(1)} BPM` : 'MRT2 listening…'}
+                  {sync.offsetValid ? ` · bar ${sync.offset >= 0 ? '+' : ''}${sync.offset.toFixed(2)}` : ''}<br />
+                  {sync.busy ? 'adjusting on the next beat…' : `${sync.reprimes} re-prime${sync.reprimes === 1 ? '' : 's'}`}
+                </div>
               )}
             </div>
           </div>

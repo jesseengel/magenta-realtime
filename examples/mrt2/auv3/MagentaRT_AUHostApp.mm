@@ -23,7 +23,7 @@
 
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
     NSAlert* alert = [[NSAlert alloc] init];
-    alert.messageText = @"Magenta RT Audio Unit";
+    alert.messageText = @"Magenta RT Audio Unit (tempo sync)";
     alert.informativeText =
         @"The Magenta RT AUv3 extension is now registered.\n"
         @"It will appear as a Generator instrument in Logic Pro, "
