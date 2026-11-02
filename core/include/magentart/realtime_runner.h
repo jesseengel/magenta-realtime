@@ -43,6 +43,7 @@
 
 #include <magentart/mlx_engine.h>
 #include <magentart/ring_buffer.h>
+#include <magentart/tempo/tempo_sync.h>
 
 #include <array>
 #include <atomic>
@@ -51,6 +52,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -290,18 +292,25 @@ public:
         reset_env_.value.store(0.0f, std::memory_order_relaxed);
     }
 
+    /// The user's buffer size (latency). With host sync on, the ring may hold
+    /// more (kSyncLeadSamples) so a re-prime never runs it dry; the reported
+    /// latency stays this value -- the sync maps the host's beat onto the
+    /// samples as they are read, so the lead does not shift the alignment.
     void set_buffer_size(std::size_t cap) {
-        ring_L_.set_virtual_capacity(cap);
-        ring_R_.set_virtual_capacity(cap);
+        user_buffer_size_.store(cap, std::memory_order_relaxed);
+        apply_ring_capacity();
     }
-    std::size_t get_buffer_size() const { return ring_L_.get_virtual_capacity(); }
+    std::size_t get_buffer_size() const { return user_buffer_size_.load(std::memory_order_relaxed); }
     std::size_t get_latency_samples() const {
         return get_latency_comp() ? get_buffer_size() : 0;
     }
 
     /// Audio-thread safe: called on DAW stopped→playing transition. Drains
     /// the ring buffers without disturbing the inference thread's write cursor.
+    /// With host sync on the buffered lead is kept (a re-prime may need it to
+    /// re-align to the new transport position right away).
     void reset_for_playback() {
+        if (get_host_sync()) return;
         ring_L_.drain();
         ring_R_.drain();
     }
@@ -309,6 +318,43 @@ public:
     /// Full reset: stops the inference thread, resets model state, clears the
     /// ring buffers, then restarts if we were running.
     void reset();
+    /// @}
+
+    /// @name Host tempo / downbeat sync (tempo-sync fork)
+    /// MRT2 follows the host's tempo and puts its downbeats on the host's bars
+    /// by re-priming its memory from time-stretched copies of its own recent
+    /// output (see magentart/tempo/tempo_sync.h). Needs the tempo export
+    /// (`magenta_rt.mlx.export_tempo`): a step with MRT2's beat read-out plus
+    /// `<model>_reprime.mlxfn` and `<model>_encoder.mlxfn`. @{
+    bool load_tempo_models(const char* reprime_mlxfn_path, const char* encoder_mlxfn_path,
+                           int context_frames = 150);
+    /// Models loaded and the step reports MRT2's beat read-out.
+    bool tempo_sync_available() const { return sync_->available(); }
+    void set_host_sync(bool on) {
+        sync_->set_enabled(on);
+        apply_ring_capacity();
+    }
+    bool get_host_sync() const { return sync_->enabled(); }
+    /// Keep MRT2's downbeats on the host's bars (else: tempo only).
+    void set_bar_lock(bool on) { sync_->set_bar_lock(on); }
+    bool get_bar_lock() const { return sync_->bar_lock(); }
+    /// Keep the explicit musiccoca CFG while synced (default on; off = only
+    /// the distilled CFG tokens, less pull toward the prompt's own tempo).
+    void set_sync_keep_cfg(bool on) { sync_->set_keep_cfg(on); }
+    bool get_sync_keep_cfg() const { return sync_->keep_cfg(); }
+    /// Audio thread, once per render call before reading audio: the host's
+    /// transport at the first sample of this buffer (`beat_position` =
+    /// AUHostMusicalContextBlock's currentBeatPosition, `measure_downbeat` =
+    /// currentMeasureDownbeatPosition). The output the host receives now is
+    /// placed `latency_seconds` earlier on its timeline (PDC), so it carries
+    /// beat `beat_position - latency * tempo / 60`. Lock-free.
+    void set_host_transport(double tempo_bpm, double beat_position, double measure_downbeat,
+                            int beats_per_bar, bool playing, double latency_seconds);
+    tempo::SyncStatus get_sync_status() const { return sync_->status(); }
+    /// Buffered audio the ring keeps with host sync on, and the part of it a
+    /// re-prime may block for.
+    static constexpr std::size_t kSyncLeadSamples = 24000;     // 0.5 s
+    static constexpr std::size_t kReprimeLeadSamples = 20160;  // 0.42 s
     /// @}
 
     /// @name State persistence @{
@@ -346,6 +392,11 @@ private:
     void start_locked(bool skip_reset = false);
     void stop_locked();
     void inference_loop();
+    /// One frame through the tempo-sync controller (tracks MRT2's beat; when
+    /// host sync is on, may re-prime first). Inference thread.
+    bool generate_one();
+    void apply_ring_capacity();
+    tempo::HostTransport read_host_transport() const;
 
     MLXEngine engine_{};
     float audio_buf_L_[kFrameSamples]{};
@@ -383,6 +434,19 @@ private:
 
     std::atomic<bool> bypass_{false};
     std::atomic<bool> host_bypass_{false};
+
+    // Host tempo sync. The host transport is published by the audio thread
+    // through a seqlock (every field atomic; `host_seq_` odd while writing).
+    std::unique_ptr<tempo::TempoSyncController> sync_;
+    std::atomic<std::size_t> user_buffer_size_{2048};
+    std::atomic<std::uint32_t> host_seq_{0};
+    std::atomic<bool> host_valid_{false};
+    std::atomic<double> host_tempo_{0.0};
+    std::atomic<double> host_beat_{0.0};
+    std::atomic<double> host_bar_{0.0};
+    std::atomic<int> host_bpb_{4};
+    std::atomic<std::uint64_t> host_cursor_{0};
+    std::atomic<bool> host_playing_{false};
 
     /// Pending reset request. Packed into a single atomic so the inference
     /// loop reads the request kind in one operation (no TOCTOU window

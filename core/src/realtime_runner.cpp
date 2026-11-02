@@ -34,7 +34,8 @@ namespace core {
 
 namespace mx = mlx::core;
 
-RealtimeRunner::RealtimeRunner() {
+RealtimeRunner::RealtimeRunner()
+    : sync_(std::make_unique<tempo::TempoSyncController>(engine_)) {
     // Default: equal blend of the first two prompt slots.
     for (int i = 0; i < (int)kMaxPrompts; ++i) {
         blend_weights_[i].store((i < 2) ? 0.5f : 0.0f, std::memory_order_relaxed);
@@ -71,6 +72,18 @@ bool RealtimeRunner::load_model(const char* mlxfn_path) {
     bool success = engine_.load_model(mlxfn_path);
     if (success) start_locked();
     return success;
+}
+
+bool RealtimeRunner::load_tempo_models(const char* reprime_mlxfn_path,
+                                       const char* encoder_mlxfn_path, int context_frames) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    // the engine warms the functions up with MLX calls: not concurrently with
+    // the inference thread
+    const bool was_running = running_.load(std::memory_order_relaxed);
+    if (was_running) stop_locked();
+    const bool ok = engine_.load_tempo_models(reprime_mlxfn_path, encoder_mlxfn_path, context_frames);
+    if (was_running) start_locked(/*skip_reset=*/true);
+    return ok;
 }
 
 bool RealtimeRunner::load_prefill_model(const char* spectrostream_mlxfn_path,
@@ -179,10 +192,11 @@ void RealtimeRunner::start_locked(bool skip_reset) {
 
     ring_L_.reset();
     ring_R_.reset();
+    sync_->reset();  // a new stream: frame f <-> ring samples [f, f + 1) * 1920
     // 3-frame priming to prevent initial audio underruns
     for (int i = 0; i < 3; ++i) {
         detail::AutoreleasePool pool;
-        engine_.generate_frame(audio_buf_L_, audio_buf_R_);
+        generate_one();
         ring_L_.write(audio_buf_L_, kFrameSamples);
         ring_R_.write(audio_buf_R_, kFrameSamples);
     }
@@ -322,6 +336,7 @@ void RealtimeRunner::reset() {
     engine_.reset_state();
     ring_L_.reset();
     ring_R_.reset();
+    sync_->reset();
 
     if (was_running) start_locked();
 }
@@ -359,6 +374,7 @@ void RealtimeRunner::reset_to_factory() {
     engine_.reset_to_factory();
     ring_L_.reset();
     ring_R_.reset();
+    sync_->reset();
 
     if (was_running) start_locked();
 }
@@ -369,7 +385,7 @@ EngineMetrics RealtimeRunner::get_metrics() const {
     return {m.transformer_ms,
             total > 0 ? total : m.total_ms,
             ring_L_.available(),
-            get_buffer_size(),
+            ring_L_.get_virtual_capacity(),  // (the sync lead when Host Sync is on)
             transport_flags_.load(std::memory_order_relaxed),
             dropped_frame_count_.load(std::memory_order_relaxed)};
 }
@@ -410,9 +426,10 @@ void RealtimeRunner::inference_loop() {
             engine_.reset_state();
             ring_L_.reset();
             ring_R_.reset();
+            sync_->reset();
             // 3-frame priming to prevent audio underruns on reset
             for (int i = 0; i < 3; ++i) {
-                engine_.generate_frame(audio_buf_L_, audio_buf_R_);
+                generate_one();
                 ring_L_.write(audio_buf_L_, kFrameSamples);
                 ring_R_.write(audio_buf_R_, kFrameSamples);
             }
@@ -439,7 +456,7 @@ void RealtimeRunner::inference_loop() {
         using clock = std::chrono::steady_clock;
         auto t0 = clock::now();
 
-        bool ok = engine_.generate_frame(audio_buf_L_, audio_buf_R_);
+        bool ok = generate_one();
         auto t1 = clock::now();
         frame_total_ms_.store(
             std::chrono::duration<float, std::milli>(t1 - t0).count(),
@@ -464,6 +481,59 @@ void RealtimeRunner::inference_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
+}
+
+// ─── Host tempo sync ────────────────────────────────────────────────────────
+
+void RealtimeRunner::apply_ring_capacity() {
+    std::size_t cap = user_buffer_size_.load(std::memory_order_relaxed);
+    if (sync_ && sync_->enabled()) cap = std::max(cap, kSyncLeadSamples);
+    ring_L_.set_virtual_capacity(cap);
+    ring_R_.set_virtual_capacity(cap);
+}
+
+void RealtimeRunner::set_host_transport(double tempo_bpm, double beat_position,
+                                        double measure_downbeat, int beats_per_bar,
+                                        bool playing, double latency_seconds) {
+    const bool valid = std::isfinite(tempo_bpm) && tempo_bpm > 1.0 &&
+                       std::isfinite(beat_position);
+    host_seq_.fetch_add(1, std::memory_order_acq_rel);  // odd: writing
+    host_valid_.store(valid, std::memory_order_relaxed);
+    host_tempo_.store(tempo_bpm, std::memory_order_relaxed);
+    host_beat_.store(beat_position - latency_seconds * tempo_bpm / 60.0,
+                     std::memory_order_relaxed);
+    host_bar_.store(measure_downbeat, std::memory_order_relaxed);
+    host_bpb_.store(beats_per_bar, std::memory_order_relaxed);
+    host_cursor_.store(ring_L_.read_position(), std::memory_order_relaxed);
+    host_playing_.store(playing, std::memory_order_relaxed);
+    host_seq_.fetch_add(1, std::memory_order_release);  // even: done
+}
+
+tempo::HostTransport RealtimeRunner::read_host_transport() const {
+    tempo::HostTransport h;
+    for (int tries = 0; tries < 8; ++tries) {
+        const std::uint32_t s1 = host_seq_.load(std::memory_order_acquire);
+        if (s1 & 1u) continue;
+        h.valid = host_valid_.load(std::memory_order_relaxed);
+        h.tempo = host_tempo_.load(std::memory_order_relaxed);
+        h.beat = host_beat_.load(std::memory_order_relaxed);
+        h.bar_start_beat = host_bar_.load(std::memory_order_relaxed);
+        h.beats_per_bar = host_bpb_.load(std::memory_order_relaxed);
+        h.cursor = host_cursor_.load(std::memory_order_relaxed);
+        h.playing = host_playing_.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (host_seq_.load(std::memory_order_relaxed) == s1) return h;
+    }
+    h.valid = false;
+    return h;
+}
+
+bool RealtimeRunner::generate_one() {
+    const bool offline = is_offline_.load(std::memory_order_relaxed);
+    // a re-prime blocks this thread for ~0.3 s: only when the ring holds that
+    // much (offline render waits for us anyway)
+    const bool can_block = offline || ring_L_.available() >= kReprimeLeadSamples;
+    return sync_->step(audio_buf_L_, audio_buf_R_, read_host_transport(), can_block);
 }
 
 void RealtimeRunner::start_recording() {

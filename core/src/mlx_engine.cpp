@@ -154,6 +154,29 @@ struct MLXEngine::Impl {
   std::optional<mx::ImportedFunction> spectrostream_encoder_fn_;
   std::optional<mx::ImportedFunction> prefill_fn_;
   std::string model_path_;
+
+  // --- Tempo sync (tempo-sync fork; see magenta_rt/mlx/export_tempo.py) ---
+  // The re-prime rebuilds every layer's temporal self-attention KV ring
+  // buffer (all CFG streams) from a fixed-length token context in one
+  // teacher-forced pass; the encoder encodes exactly that many frames.
+  std::optional<mx::ImportedFunction> reprime_fn_;
+  std::optional<mx::ImportedFunction> tempo_encoder_fn_;
+  int reprime_frames_ = 0;
+  // The step export also outputs MRT2's beat / downbeat read-out (logits)
+  // as outputs[1]; detected from the output count on every call.
+  bool step_has_readout_ = false;
+  float last_readout_[2] = {0.0f, 0.0f};
+  // false: no explicit musiccoca CFG term (negative = positive conditioning);
+  // the distilled CFG tokens still carry the scale. Host tempo sync turns
+  // this off: with explicit guidance the style's preferred tempo pulls the
+  // music back after a re-prime.
+  std::atomic<bool> explicit_cfg_musiccoca_{true};
+  bool load_tempo_models(const char *reprime_path, const char *encoder_path,
+                         int frames);
+  bool reprime_from_audio(const float *audio_L, const float *audio_R,
+                          int num_samples);
+  // Number of extra outputs between audio and state (0 or 1 = read-out).
+  size_t take_step_outputs(const std::vector<mx::array> &outputs);
   std::function<std::vector<mx::array>(const std::vector<mx::array> &)>
       compiled_fn_;
   std::vector<mx::array> transformer_state_;
@@ -1200,7 +1223,8 @@ bool MLXEngine::Impl::prefill_with_token_array(
       log_callback("[PROGRESS] " + std::to_string(percent));
     }
 
-    transformer_state_.assign(outputs.begin() + 1, outputs.end());
+    const size_t n_extra = take_step_outputs(outputs);
+    transformer_state_.assign(outputs.begin() + 1 + n_extra, outputs.end());
   }
 
   // Seed previous_frame with the *last* token (tokens[N-1]) without
@@ -1281,6 +1305,10 @@ void MLXEngine::Impl::unload() {
   transformer_state_.clear();
   transformer_initial_state_.clear();
   transformer_factory_state_.clear();
+  reprime_fn_.reset();
+  tempo_encoder_fn_.reset();
+  reprime_frames_ = 0;
+  step_has_readout_ = false;
 }
 
 void MLXEngine::Impl::reset_state() {
@@ -1552,6 +1580,11 @@ bool MLXEngine::Impl::generate_frame(float *audio_L, float *audio_R,
   for (int i = 0; i < num_pitches; ++i) {
     neg_notes_ptr[kMusicCoCaRVQLevels + i] = kNumReservedTokens - 1;
   }
+  if (!explicit_cfg_musiccoca_.load(std::memory_order_relaxed)) {
+    // Tempo sync: no explicit musiccoca guidance (cond - neg = 0). The
+    // distilled CFG tokens appended by the export still use cfg_musiccoca.
+    std::memcpy(neg_musiccoca_ptr, cond_ptr, cond_len * sizeof(int32_t));
+  }
 
   // Update state in persistent_args_
   // cond(0), temp(1), top_k(2), cfg_mc(3), cfg_n(4), cfg_d(5),
@@ -1585,7 +1618,8 @@ bool MLXEngine::Impl::generate_frame(float *audio_L, float *audio_R,
     memset(audio_L, 0, kFrameSamples * sizeof(float));
     memset(audio_R, 0, kFrameSamples * sizeof(float));
   }
-  transformer_state_.assign(outputs.begin() + 1, outputs.end());
+  const size_t n_extra = take_step_outputs(outputs);
+  transformer_state_.assign(outputs.begin() + 1 + n_extra, outputs.end());
 
   // Optionally extract the just-sampled raw RVQ tokens. The
   // decoder-internal previous_frame slot in transformer_state_ holds
@@ -1637,6 +1671,123 @@ bool MLXEngine::Impl::generate_frame(float *audio_L, float *audio_R,
   last_metrics_.total_ms = last_metrics_.transformer_ms;
 
   return true;
+}
+
+// ─── Tempo sync (tempo-sync fork) ───────────────────────────────────────────
+
+size_t MLXEngine::Impl::take_step_outputs(const std::vector<mx::array> &outputs) {
+  // [audio, *state] (upstream export) or [audio, readout, *state] (tempo
+  // export). transformer_state_ still holds the previous state here.
+  const size_t n_state = transformer_state_.size();
+  const size_t n_extra =
+      outputs.size() > n_state + 1 ? outputs.size() - n_state - 1 : 0;
+  step_has_readout_ = (n_extra == 1);
+  if (step_has_readout_) {
+    auto ro = mx::astype(outputs[1], mx::float32);
+    mx::eval(ro);
+    const float *p = ro.data<float>();
+    last_readout_[0] = p[0];
+    last_readout_[1] = p[1];
+  }
+  return n_extra;
+}
+
+bool MLXEngine::Impl::load_tempo_models(const char *reprime_path,
+                                        const char *encoder_path, int frames) {
+  try {
+    reprime_fn_ = mx::import_function(reprime_path);
+    tempo_encoder_fn_ = mx::import_function(encoder_path);
+    reprime_frames_ = frames;
+    // Warm up both functions once (the first call compiles / allocates and
+    // takes ~1 s, which would run the audio ring dry at the first re-prime).
+    // Outputs are discarded: the live state is not touched. Call while the
+    // inference thread is stopped.
+    {
+      const int n = frames * static_cast<int>(kFrameSamples);
+      mx::array silence = mx::zeros({1, n, 2}, mx::float32);
+      auto enc = (*tempo_encoder_fn_)({silence});
+      mx::array codes = enc[0];
+      if (codes.shape().back() > static_cast<int>(kNumRVQLevels))
+        codes = mx::slice(codes, {0, 0, 0},
+                          {1, codes.shape(1), static_cast<int>(kNumRVQLevels)});
+      codes = mx::astype(codes, mx::int32);
+      mx::eval(codes);
+      if (persistent_args_initialized_ && !transformer_state_.empty()) {
+        std::vector<mx::array> args;
+        args.push_back(codes);
+        for (int i : {0, 3, 4, 5, 6, 7}) args.push_back(persistent_args_[i]);
+        args.insert(args.end(), transformer_state_.begin(), transformer_state_.end());
+        auto out = (*reprime_fn_)(args);
+        mx::eval(out);
+      }
+    }
+    add_log("[MLXEngine] Loaded tempo-sync re-prime + encoder (" +
+            std::to_string(frames) + " frames of context).");
+    return true;
+  } catch (const std::exception &e) {
+    reprime_fn_.reset();
+    tempo_encoder_fn_.reset();
+    reprime_frames_ = 0;
+    const std::string err =
+        std::string("[MLXEngine] Failed to load tempo-sync models: ") + e.what();
+    std::cerr << err << std::endl;
+    add_log(err);
+    return false;
+  }
+}
+
+// Rebuild the transformer's attention memory from audio (exactly
+// reprime_frames_ * kFrameSamples stereo samples at 48 kHz), as if the model
+// had just heard it: SpectroStream-encode the audio, then one teacher-forced
+// all-frames pass over the codes (the re-prime export) replaces every
+// layer's self-attention KV ring buffer and the previous-frame tokens. The
+// time step, the conditioning buffers and the decoder's audio state are kept,
+// so the output continues without a reset. Inference-thread only.
+bool MLXEngine::Impl::reprime_from_audio(const float *audio_L,
+                                         const float *audio_R,
+                                         int num_samples) {
+  if (!reprime_fn_ || !tempo_encoder_fn_ || !persistent_args_initialized_)
+    return false;
+  if (num_samples != reprime_frames_ * static_cast<int>(kFrameSamples))
+    return false;
+  try {
+    std::vector<float> inter(static_cast<size_t>(num_samples) * 2);
+    for (int i = 0; i < num_samples; ++i) {
+      inter[2 * i] = audio_L[i];
+      inter[2 * i + 1] = audio_R[i];
+    }
+    mx::array audio(inter.data(), {1, num_samples, 2}, mx::float32);
+    auto enc = (*tempo_encoder_fn_)({audio});
+    mx::array codes = enc[0];
+    if (codes.shape().back() > static_cast<int>(kNumRVQLevels)) {
+      codes = mx::slice(codes, {0, 0, 0},
+                        {1, codes.shape(1), static_cast<int>(kNumRVQLevels)});
+    }
+    codes = mx::astype(codes, mx::int32);
+    // [codes, cond, cfg_mc, cfg_notes, cfg_drums, neg_mc, neg_notes, *state]
+    // with the conditioning generate_frame last used.
+    std::vector<mx::array> args;
+    args.reserve(8 + transformer_state_.size());
+    args.push_back(codes);
+    for (int i : {0, 3, 4, 5, 6, 7}) args.push_back(persistent_args_[i]);
+    args.insert(args.end(), transformer_state_.begin(), transformer_state_.end());
+    auto out = (*reprime_fn_)(args);
+    if (out.size() != transformer_state_.size()) {
+      std::cerr << "[MLXEngine] re-prime returned " << out.size()
+                << " arrays, expected " << transformer_state_.size() << std::endl;
+      return false;
+    }
+    mx::eval(out);
+    transformer_state_.assign(out.begin(), out.end());
+    const int kStateStart = 9;
+    for (size_t i = 0; i < transformer_state_.size(); ++i)
+      persistent_args_[kStateStart + i] = transformer_state_[i];
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "[MLXEngine] re-prime failed: " << e.what() << std::endl;
+    add_log(std::string("[MLXEngine] re-prime failed: ") + e.what());
+    return false;
+  }
 }
 
 void MLXEngine::Impl::set_text_prompt(const std::string &text) {
@@ -2527,6 +2678,30 @@ bool MLXEngine::generate_frame(float *L, float *R, std::int32_t *tokens_out) {
 }
 const FrameMetrics &MLXEngine::last_metrics() const {
   return impl_->last_metrics_;
+}
+
+// Tempo sync
+bool MLXEngine::load_tempo_models(const char *reprime_path,
+                                  const char *encoder_path, int frames) {
+  return impl_->load_tempo_models(reprime_path, encoder_path, frames);
+}
+bool MLXEngine::has_tempo_models() const {
+  return impl_->reprime_fn_.has_value() && impl_->tempo_encoder_fn_.has_value();
+}
+int MLXEngine::reprime_context_frames() const { return impl_->reprime_frames_; }
+bool MLXEngine::step_has_readout() const { return impl_->step_has_readout_; }
+bool MLXEngine::reprime_from_audio(const float *L, const float *R, int n) {
+  return impl_->reprime_from_audio(L, R, n);
+}
+void MLXEngine::last_readout(float out[2]) const {
+  out[0] = impl_->last_readout_[0];
+  out[1] = impl_->last_readout_[1];
+}
+void MLXEngine::set_explicit_cfg_musiccoca(bool on) {
+  impl_->explicit_cfg_musiccoca_.store(on, std::memory_order_relaxed);
+}
+bool MLXEngine::get_explicit_cfg_musiccoca() const {
+  return impl_->explicit_cfg_musiccoca_.load(std::memory_order_relaxed);
 }
 
 // Prompts — text

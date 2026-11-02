@@ -118,6 +118,16 @@ set(FETCHCONTENT_SOURCE_DIR_TENSORFLOW "${CMAKE_BINARY_DIR}/_deps/tensorflow-lit
 message(STATUS "Fetching tensorflow-lite... (this may take a long time due to repo size)")
 FetchContent_MakeAvailable(tensorflow-lite)
 
+# Signalsmith Stretch (MIT, header-only): time-stretches MRT2's recent output
+# for the tempo-sync re-prime (core/src/tempo/tempo_sync.cpp).
+FetchContent_Declare(
+  signalsmith-stretch
+  GIT_REPOSITORY https://github.com/Signalsmith-Audio/signalsmith-stretch.git
+  GIT_TAG        1.4.0
+  GIT_SHALLOW    ON
+)
+FetchContent_MakeAvailable(signalsmith-stretch)
+
 
 
 # --- Host-shared settings -----------------------------------------------------
@@ -243,6 +253,7 @@ add_subdirectory(examples/mrt2/standalone)
 add_subdirectory(examples/jam)
 add_subdirectory(examples/collider)
 add_subdirectory(examples/hello_mrt2)
+add_subdirectory(examples/tempo_sync_cli)
 add_subdirectory(examples/max)
 add_subdirectory(examples/pd)
 add_subdirectory(examples/sc)

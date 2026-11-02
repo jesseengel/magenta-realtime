@@ -24,6 +24,8 @@ add_library(magentart_core STATIC
     src/realtime_runner.cpp
     src/autorelease_pool.cpp
     src/midi_note_tracker.cpp
+    src/tempo/beat_tracker.cpp
+    src/tempo/tempo_sync.cpp
 )
 add_library(magentart::core ALIAS magentart_core)
 
@@ -36,6 +38,9 @@ target_include_directories(magentart_core PRIVATE
 )
 
 target_compile_features(magentart_core PUBLIC cxx_std_20)
+
+# Signalsmith Stretch is only used inside tempo_sync.cpp.
+target_link_libraries(magentart_core PRIVATE signalsmith-stretch)
 
 target_link_libraries(magentart_core PUBLIC
     mlx

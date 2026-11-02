@@ -114,16 +114,24 @@ std::string get_default_model_dir() {
 std::string find_mlxfn_in_dir(const std::string& dir_path) {
     DIR* dir = opendir(dir_path.c_str());
     if (!dir) return "";
+    // The step function: `<dir name>.mlxfn` if present, else the first
+    // .mlxfn that is not a side export (tempo-sync `_reprime` / `_encoder`,
+    // `spectrostream_encoder`).
+    const std::string base = dir_path.substr(dir_path.find_last_of('/') + 1);
+    std::string first;
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string name = entry->d_name;
-        if (ends_with(name, ".mlxfn")) {
+        if (!ends_with(name, ".mlxfn")) continue;
+        if (name == base + ".mlxfn") {
             closedir(dir);
             return dir_path + "/" + name;
         }
+        if (first.empty() && !ends_with(name, "_reprime.mlxfn") && !ends_with(name, "_encoder.mlxfn"))
+            first = name;
     }
     closedir(dir);
-    return "";
+    return first.empty() ? "" : dir_path + "/" + first;
 }
 
 bool is_valid_model_dir(const std::string& dir_path) {

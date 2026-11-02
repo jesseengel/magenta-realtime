@@ -35,8 +35,11 @@ namespace core {
 
 class RingBuffer {
 public:
-    /// Maximum buffered samples (~4 model blocks). Must be a power of two.
-    static constexpr size_t kCapacity = 8192;
+    /// Maximum buffered samples. Must be a power of two. 32768 (0.68 s) leaves
+    /// room for the larger lead host tempo sync keeps (a re-prime blocks the
+    /// inference thread for ~0.3 s); the latency is set by the virtual
+    /// capacity below, not by this.
+    static constexpr size_t kCapacity = 32768;
 
     RingBuffer() : buffer_{}, write_pos_(0), read_pos_(0), virtual_capacity_(2048) {}
 
@@ -56,6 +59,11 @@ public:
         return write_pos_.load(std::memory_order_acquire) -
                read_pos_.load(std::memory_order_relaxed);
     }
+
+    /// Total samples consumed / produced since the last reset (stream
+    /// positions; 48 kHz samples of the generated stream).
+    size_t read_position() const { return read_pos_.load(std::memory_order_acquire); }
+    size_t write_position() const { return write_pos_.load(std::memory_order_acquire); }
 
     /// Samples the producer may write right now without blocking.
     size_t free_space() const {

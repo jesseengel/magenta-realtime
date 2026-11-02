@@ -246,6 +246,35 @@ public:
   const FrameMetrics &last_metrics() const;
   /// @}
 
+  /// @name Tempo sync (tempo-sync fork)
+  /// Exports from `magenta_rt.mlx.export_tempo`: a step that also outputs
+  /// MRT2's beat / downbeat read-out, a parallel "re-prime" and a
+  /// fixed-length SpectroStream encoder. See `magentart/tempo/tempo_sync.h`.
+  /// @{
+
+  /// Load `<model>_reprime.mlxfn` and `<model>_encoder.mlxfn` (controller
+  /// thread). `context_frames`: the context length they were exported for.
+  bool load_tempo_models(const char *reprime_mlxfn_path,
+                         const char *encoder_mlxfn_path,
+                         int context_frames = 150);
+  bool has_tempo_models() const;
+  int reprime_context_frames() const;
+  /// True once a `generate_frame` call returned a beat read-out.
+  bool step_has_readout() const;
+  /// Beat / downbeat logits of the frame the last `generate_frame` produced.
+  void last_readout(float out[2]) const;
+  /// Rebuild the model's attention memory from `num_samples` (=
+  /// `reprime_context_frames() * kFrameSamples`) of 48 kHz stereo audio, as
+  /// if it had just heard it; generation continues from there without a
+  /// reset. Inference-thread only (like `generate_frame`); ~0.25 s.
+  bool reprime_from_audio(const float *audio_L, const float *audio_R,
+                          int num_samples);
+  /// Explicit musiccoca CFG on (default) / off (negative = positive
+  /// conditioning; the distilled CFG tokens keep the scale). Atomic.
+  void set_explicit_cfg_musiccoca(bool on);
+  bool get_explicit_cfg_musiccoca() const;
+  /// @}
+
   /// @name Prompts — text
   /// UI thread. Kicks an async MusicCoCa encode on an internal thread.
   /// Poll `get_text_encoder_status()` / `get_quantizer_status()` for progress.
