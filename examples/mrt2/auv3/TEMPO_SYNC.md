@@ -173,6 +173,29 @@ mrt2-mech-interp's `rhythm/au_sync/` has the evaluation:
 `run_cli_bench.sh`, then `eval_tempo_sync.py`. It decodes the beats with
 unmodified MRT2 and compares the music with the simulated host's grid.
 
+## Results (offline harness)
+
+These runs use the plan of mrt2-mech-interp's Ableton Link test:
+
+- The host is at 112 BPM and Host Sync turns on at 8 s.
+- The host tempo goes to 120 at 28 s and to 116 at 46 s.
+- Six styles are used, measured offline with unmodified MRT2.
+
+Results with the defaults:
+
+- **11 of 18 windows** have MRT2's downbeats on the host's bar (within 0.25
+  beat): funk, rock and disco 3/3, house 2/3, boom bap and afrobeat 0/3.
+  The Python Conductor with Ableton Link scored 10/18 on the same plan.
+- **Tempo** is within 1 % (median). When aligned, the beats sit 28 ms and the
+  attacks 16 ms from the host's beats (median).
+- **About 6 re-primes per minute**, each blocking about 0.3 s, with 0
+  underruns in 21 runs.
+- **After a +1.5-beat locate**, all 3 runs re-aligned.
+- **Sync Keeps CFG off** scores 12/18. Boom bap, whose own tempo is 18–26 %
+  below the host's here, then locks 3/3, but house and rock lose windows.
+
+Details: mrt2-mech-interp `rhythm/au_sync/README.md`.
+
 ## Limits
 
 - **Re-primes are not perfect.** MRT2's tempo after a re-prime is within
@@ -182,6 +205,8 @@ unmodified MRT2 and compares the music with the simulated host's grid.
   signature is read as `numerator * 4 / denominator` quarter notes per bar.
 - **Continuous tempo automation** re-primes at most about once per beat. It
   follows ramps in steps.
+- **Styles whose read-out switches metrical level do not lock.** Afrobeat
+  is the example; it failed in the Python version too.
 - **Tested offline only.** It has been tested in the CLI harness, not yet
   in a DAW.
 
